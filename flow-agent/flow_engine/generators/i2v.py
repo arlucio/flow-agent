@@ -11,6 +11,14 @@ from flow_server.media_types import sniff_media_type
 log = logging.getLogger("flow_engine.generators.i2v")
 
 
+def _safe_error_text(value) -> str | None:
+    """Return a bounded scalar error without serializing arbitrary responses."""
+    if not isinstance(value, (str, int, float)):
+        return None
+    text = " ".join(str(value).split())
+    return text[:500] or None
+
+
 async def upload_image(
     bridge,
     image_path: str,
@@ -52,11 +60,20 @@ async def upload_image(
     log.info("Uploading image: %s", os.path.basename(image_path))
     result = await bridge.api_request(ENDPOINTS["upload_image"], body)
 
-    status = result.get("status", 0)
-    data = result.get("data", {})
+    status = result.get("status", 0) if isinstance(result, dict) else 0
+    data = result.get("data", {}) if isinstance(result, dict) else {}
     if status != 200:
-        err = data.get("error", {}).get("message", "Unknown") if isinstance(data, dict) else str(data)
-        err_msg = f"Image upload failed: {err}"
+        nested = data.get("error", {}) if isinstance(data, dict) else {}
+        nested = nested if isinstance(nested, dict) else {}
+        message = _safe_error_text(nested.get("message"))
+        google_status = _safe_error_text(nested.get("status"))
+        top_level_error = _safe_error_text(result.get("error")) if isinstance(result, dict) else None
+        detail = message or top_level_error or google_status or "Unknown error"
+        if message and google_status and google_status not in message:
+            detail = f"{message} ({google_status})"
+        status_text = _safe_error_text(status)
+        status_suffix = f" (status {status_text})" if status_text and status_text != "0" else ""
+        err_msg = f"Image upload failed{status_suffix}: {detail}"
         log.error("%s", err_msg)
         raise ValueError(err_msg)
 

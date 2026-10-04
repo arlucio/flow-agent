@@ -35,13 +35,37 @@ def _load_env_files():
                     os.environ.setdefault(key.strip(), val.strip().strip("'\""))
         except Exception:
             pass
+    # User-level env survives reinstalls (same contract as flow_engine.config).
+    user_env = os.path.join(os.path.expanduser("~"), ".config", "flow-agent", "env")
+    if os.path.exists(user_env):
+        try:
+            with open(user_env, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, val = line.split("=", 1)
+                    os.environ.setdefault(key.strip(), val.strip().strip("'\""))
+        except Exception:
+            pass
 
 _load_env_files()
 
 # Flow Agent Backend Base URL — honour the same env vars the backend binds to,
-# so MCP keeps working even if the port is changed in .env.
+# so MCP keeps working even if the port is changed in .env. If neither env var
+# is set, fall back to the port file the live backend writes on startup.
 _API_HOST = os.environ.get("OPENAI_API_HOST", "127.0.0.1")
-_API_PORT = os.environ.get("OPENAI_API_PORT", "8001")
+_API_PORT = os.environ.get("OPENAI_API_PORT")
+if not _API_PORT:
+    try:
+        state_file = os.path.join(
+            os.path.expanduser("~"), ".local", "state", "flow-agent", "backend.json"
+        )
+        with open(state_file, "r", encoding="utf-8") as f:
+            _API_PORT = str(json.load(f).get("port") or "") or None
+    except Exception:
+        _API_PORT = None
+_API_PORT = _API_PORT or "8001"
 FLOW_API_URL = os.environ.get("FLOW_API_URL", f"http://{_API_HOST}:{_API_PORT}")
 DEFAULT_IMAGE_MODEL = os.environ.get("IMAGE_MODEL", "gem_pix_2").lower()
 _MODEL_ALIASES = {

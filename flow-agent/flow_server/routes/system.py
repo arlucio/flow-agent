@@ -5,6 +5,7 @@ Extension transport (WebSocket / HTTP callback), model listing, credits,
 token refresh, and health/liveness endpoints.
 """
 
+import json
 import time
 import asyncio
 import logging
@@ -178,6 +179,39 @@ async def refresh_tokens(x_client_id: Optional[str] = Header(None, alias="X-Clie
 @router.get("/")
 async def root():
     return {"status": "running", "service": "Flow Agent API"}
+
+
+@router.post("/api/dev/reload")
+async def dev_reload():
+    bridge = state.get_bridge()
+    if bridge:
+        await bridge.reload_extensions()
+        return {"ok": True}
+    return {"ok": False}
+
+
+@router.post("/api/dev/reload_tabs")
+async def dev_reload_tabs():
+    bridge = state.get_bridge()
+    if bridge:
+        await bridge.reload_flow_tabs()
+        return {"ok": True}
+    return {"ok": False}
+
+
+@router.post("/api/dev/probe")
+async def dev_probe(probe_type: str = "default", code: str = None, args: str = None):
+    bridge = state.get_bridge()
+    if bridge:
+        parsed_args = None
+        if args:
+            try:
+                parsed_args = json.loads(args)
+            except (ValueError, TypeError):
+                parsed_args = [args]
+        res = await bridge.run_probe(probe_type, code=code, args=parsed_args)
+        return res
+    return {"error": "Bridge not running"}
 
 
 # Health Check

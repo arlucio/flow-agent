@@ -60,6 +60,10 @@ class ExtensionBridge:
         self._client_sems: dict[str, asyncio.Semaphore] = {}
         self._client_locks: dict[str, asyncio.Lock] = {}
         self._client_last_request_at: dict[str, float] = {}
+        # Cooldown for auto open/refresh-Flow-tab requests. Without this, every
+        # WS reconnect and every readiness poll re-fires them — a client with no
+        # token otherwise gets its Flow tab reloaded every few seconds.
+        self._last_tab_request_at: dict[str, float] = {}
         self._http_server = None
         self._callback_secret = secrets.token_urlsafe(32)
         self.http_registry = ExtensionHttpRegistry(session_ttl_sec=session_ttl_sec)
@@ -167,6 +171,7 @@ class ExtensionBridge:
             self._client_sems.pop(cid, None)
             self._client_locks.pop(cid, None)
             self._client_last_request_at.pop(cid, None)
+            self._last_tab_request_at.pop(cid, None)
         if not self._clients and not self.http_registry.has_online_session():
             self._connected.clear()
 
@@ -307,6 +312,7 @@ class ExtensionBridge:
             self._client_sems.pop(client_id, None)
             self._client_locks.pop(client_id, None)
             self._client_last_request_at.pop(client_id, None)
+            self._last_tab_request_at.pop(client_id, None)
             if not self._clients:
                 self._connected.clear()
 
@@ -345,7 +351,6 @@ class ExtensionBridge:
         if not auto_fix:
             return any(self._tokens.values())
 
-        log.info("Extensions connected but no auth tokens — requesting flow tabs...")
         for cid in list(self._clients.keys()):
             if not self._tokens.get(cid):
                 await self._request_flow_tab_for(cid)
@@ -377,6 +382,11 @@ class ExtensionBridge:
             return
         if self._tokens.get(client_id):
             return
+        now = _time.monotonic()
+        if now - self._last_tab_request_at.get(client_id, 0.0) < 60.0:
+            log.debug("Flow tab request for %s suppressed by 60s cooldown", client_id)
+            return
+        self._last_tab_request_at[client_id] = now
         try:
             log.info("Requesting client %s to open/refresh Flow tab...", client_id)
             await self.send_message_to(client_id, {"method": "open_flow_tab"})
@@ -399,6 +409,42 @@ class ExtensionBridge:
             await asyncio.sleep(6)
         except Exception as e:
             log.debug("Force-refresh failed for client %s: %s", client_id, e)
+
+    async def reload_extensions(self):
+        """Ask all connected extensions to reload themselves."""
+        for cid in list(self._clients.keys()):
+            try:
+                await self.send_message_to(cid, {"method": "reload_extension"})
+            except Exception as e:
+                log.debug("Failed to send reload_extension to client %s: %s", cid, e)
+
+    async def reload_flow_tabs(self):
+        """Ask connected extensions to reload their Flow tabs."""
+        for cid in list(self._clients.keys()):
+            try:
+                await self.send_message_to(cid, {"method": "reload_tabs"})
+            except Exception as e:
+                log.debug("Failed to send reload_tabs to client %s: %s", cid, e)
+
+    async def run_probe(self, probe_type="default", timeout=60, code=None, args=None):
+        client_id = self._select_client()
+        if not client_id:
+            return {"error": "NO_CLIENT"}
+        req_id = str(uuid.uuid4())
+        future = self._loop.create_future()
+        self._pending[req_id] = future
+        params = {"probeType": probe_type}
+        if code is not None:
+            params["code"] = code
+        if args is not None:
+            params["args"] = args
+        await self.send_message_to(client_id, {"id": req_id, "method": "run_probe", "params": params})
+        try:
+            return await asyncio.wait_for(future, timeout=timeout)
+        except Exception as e:
+            return {"error": str(e)}
+        finally:
+            self._pending.pop(req_id, None)
 
     async def _request_flow_tab(self):
         """Fallback that triggers open_flow_tab on all connected clients."""
@@ -429,6 +475,7 @@ class ExtensionBridge:
             self._client_sems.pop(client_id, None)
             self._client_locks.pop(client_id, None)
             self._client_last_request_at.pop(client_id, None)
+            self._last_tab_request_at.pop(client_id, None)
             if not self._clients:
                 self._connected.clear()
 

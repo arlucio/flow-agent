@@ -22,6 +22,31 @@ ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
+
+def _load_env_files():
+    """Same .env/config.env contract as flow_engine.config, applied before the
+    CLI reads any port/host env vars so every invocation — regardless of shell —
+    sees the deployment's configured ports. The user-level file lives outside
+    the install tree so it survives reinstalls."""
+    candidates = [
+        os.path.join(ROOT_DIR, ".env"),
+        os.path.join(ROOT_DIR, "config.env"),
+        os.path.join(os.path.expanduser("~"), ".config", "flow-agent", "env"),
+    ]
+    for path in candidates:
+        if not os.path.exists(path):
+            continue
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                os.environ.setdefault(key.strip(), val.strip().strip("'\""))
+
+
+_load_env_files()
+
 SHUTDOWN_TIMEOUT = int(os.environ.get("SHUTDOWN_TIMEOUT", "5"))
 EXIT_BACKEND_UNAVAILABLE = 3
 EXIT_NOT_READY = 4
@@ -38,10 +63,48 @@ class CliError(Exception):
         self.retryable = retryable
 
 
-def _api_base() -> str:
+_active_base = None
+
+
+def _default_api_base() -> str:
     host = os.environ.get("OPENAI_API_HOST", "127.0.0.1")
     port = os.environ.get("OPENAI_API_PORT", "8001")
     return f"http://{host}:{port}"
+
+
+def _api_base() -> str:
+    return _active_base or _default_api_base()
+
+
+def _backend_state_file() -> str:
+    state_home = os.environ.get("XDG_STATE_HOME") or os.path.join(
+        os.path.expanduser("~"), ".local", "state"
+    )
+    return os.path.join(state_home, "flow-agent", "backend.json")
+
+
+def _candidate_api_bases() -> list:
+    """Bases to probe, in order: the configured (env/.env) base, then the base
+    the last-started backend recorded, then the upstream default. This keeps
+    `flow status` working from shells that never inherited the port env vars."""
+    bases = [_default_api_base()]
+    try:
+        with open(_backend_state_file(), "r", encoding="utf-8") as f:
+            recorded = json.load(f)
+        host = str(recorded.get("host") or "").strip()
+        port = int(recorded.get("port") or 0)
+        if host and 0 < port < 65536:
+            bases.append(f"http://{host}:{port}")
+    except (OSError, ValueError, TypeError):
+        pass
+    bases.append("http://127.0.0.1:8001")
+    seen = set()
+    ordered = []
+    for base in bases:
+        if base not in seen:
+            seen.add(base)
+            ordered.append(base)
+    return ordered
 
 
 def _fail(message, exit_code=1):
@@ -62,14 +125,15 @@ def _error_detail(raw):
     return str(value)
 
 
-def _request_json(path, *, method="GET", payload=None, headers=None, timeout=30):
+def _request_json(path, *, method="GET", payload=None, headers=None, timeout=30, base=None):
+    base = base or _api_base()
     request_headers = dict(headers or {})
     data = None
     if payload is not None:
         data = json.dumps(payload).encode("utf-8")
         request_headers.setdefault("Content-Type", "application/json")
     request = urllib.request.Request(
-        f"{_api_base()}{path}", data=data, headers=request_headers, method=method
+        f"{base}{path}", data=data, headers=request_headers, method=method
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -83,39 +147,53 @@ def _request_json(path, *, method="GET", payload=None, headers=None, timeout=30)
         ) from error
     except (urllib.error.URLError, TimeoutError, OSError) as error:
         raise CliError(
-            f"could not reach the backend at {_api_base()}: {error}",
+            f"could not reach the backend at {base}: {error}",
             EXIT_BACKEND_UNAVAILABLE,
             retryable=True,
         ) from error
     except (json.JSONDecodeError, ValueError) as error:
         raise CliError(
-            f"backend at {_api_base()} returned invalid JSON: {error}",
+            f"backend at {base} returned invalid JSON: {error}",
             EXIT_API_ERROR,
         ) from error
 
 
-def _probe_backend(timeout=2):
-    """Return health JSON for a Flow backend, otherwise ``None``."""
+def _probe_backend_at(base, timeout=2):
+    """Return health JSON when `base` is a Flow backend, otherwise ``None``."""
 
     try:
-        data, status = _request_json("/health", timeout=timeout)
+        data, status = _request_json("/health", timeout=timeout, base=base)
     except CliError:
         return None
     if status != 200 or not isinstance(data, dict):
         return None
-    # Do not mistake an unrelated service on port 8001 for Flow.  Older Flow
-    # versions may only return status/connected while their bridge starts.
+    # Do not mistake an unrelated service on a shared port for Flow.  Older
+    # Flow versions may only return status/connected while their bridge starts.
     flow_statuses = {"starting", "healthy", "unauthorized_or_disconnected"}
     if data.get("status") not in flow_statuses:
         return None
     return data
 
 
-def _ensure_backend():
-    """Reuse the port-8001 backend, starting exactly one only when absent."""
+def _probe_backend(timeout=2):
+    """Return ``(base, health)`` for the first reachable Flow backend across
+    the configured base, the recorded state file, and the default port."""
 
-    health = _probe_backend()
+    for base in _candidate_api_bases():
+        health = _probe_backend_at(base, timeout=timeout)
+        if health is not None:
+            return base, health
+    return None, None
+
+
+def _ensure_backend():
+    """Reuse an already-running backend wherever it lives; start one only
+    when no candidate base answers."""
+
+    global _active_base
+    base, health = _probe_backend()
     if health is not None:
+        _active_base = base
         return health
 
     import subprocess
@@ -140,9 +218,10 @@ def _ensure_backend():
     deadline = time.monotonic() + startup_timeout
     while time.monotonic() < deadline:
         time.sleep(0.25)
-        health = _probe_backend(timeout=1)
+        base, health = _probe_backend(timeout=1)
         if health is not None:
-            print(f"[flow] Backend started at {_api_base()}.")
+            _active_base = base
+            print(f"[flow] Backend started at {base}.")
             return health
 
     _fail(
@@ -155,6 +234,7 @@ def _ensure_backend():
 def _wait_for_generation_ready(timeout=None):
     """Wait for both the extension socket and captured Flow key."""
 
+    global _active_base
     health = _ensure_backend()
     if health.get("extension_connected") is True and health.get("has_flow_key") is True:
         return health
@@ -164,7 +244,10 @@ def _wait_for_generation_ready(timeout=None):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         time.sleep(0.5)
-        health = _probe_backend(timeout=2) or {}
+        base, health = _probe_backend(timeout=2)
+        health = health or {}
+        if base:
+            _active_base = base
         if health.get("extension_connected") is True and health.get("has_flow_key") is True:
             return health
 
@@ -452,12 +535,26 @@ def run_backend(argv):
 
     # Invoking `flow` a second time should attach to/reuse the healthy service,
     # not ask uvicorn to bind the same port and start another bridge lifespan.
-    existing = _probe_backend()
-    if existing is not None:
-        print(f"Flow backend already running at {_api_base()}; reusing it.")
+    # Explicit --host/--port for a different address still wins.
+    global _active_base
+    requested_base = f"http://{args.host}:{args.port}"
+    explicit_flags = any(
+        a == "--host" or a.startswith("--host=")
+        or a == "--port" or a.startswith("--port=")
+        for a in argv
+    )
+    base, existing = _probe_backend()
+    if existing is not None and (base == requested_base or not explicit_flags):
+        _active_base = base
+        print(f"Flow backend already running at {base}; reusing it.")
         return
 
     import uvicorn
+
+    # Keep env in sync with the actual bind so the lifespan's state file and
+    # any child processes agree on where the backend lives.
+    os.environ["OPENAI_API_HOST"] = args.host
+    os.environ["OPENAI_API_PORT"] = str(args.port)
 
     print(f"Flow starting on http://{args.host}:{args.port}")
     print("Waiting for the Chrome extension (open Google Flow in Chrome to connect).")

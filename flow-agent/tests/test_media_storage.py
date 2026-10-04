@@ -2,6 +2,7 @@ import asyncio
 import importlib
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -214,6 +215,61 @@ def test_stale_media_id_is_invalidated_and_uploaded_once(monkeypatch, tmp_path):
     assert bridge.upload_calls == 1
     assert bridge.validation_calls == 2
     assert media_store.get_for_file(image_path, project_id="project-a")["media_id"] == "fresh-id"
+
+
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [
+        (
+            {"status": 403, "error": "CAPTCHA_FAILED"},
+            "Image upload failed (status 403): CAPTCHA_FAILED",
+        ),
+        ({"error": "Request timed out"}, "Image upload failed: Request timed out"),
+        (
+            {"status": 500, "error": {"debug": {"internal": "sensitive-context"}}},
+            "Image upload failed (status 500): Unknown error",
+        ),
+        (
+            {
+                "status": 400,
+                "data": {
+                    "error": {
+                        "message": "The image could not be processed",
+                        "status": "INVALID_ARGUMENT",
+                    }
+                },
+            },
+            "Image upload failed (status 400): The image could not be processed (INVALID_ARGUMENT)",
+        ),
+    ],
+)
+def test_upload_image_preserves_safe_actionable_errors(
+    monkeypatch, tmp_path, response, expected
+):
+    _configure_store(monkeypatch, tmp_path)
+    image_path = tmp_path / "reference.png"
+    image_path.write_bytes(PNG_BYTES)
+
+    class Bridge:
+        async def api_request(self, endpoint, body, **kwargs):
+            return response
+
+    with pytest.raises(ValueError, match=re.escape(expected)):
+        asyncio.run(upload_image(Bridge(), str(image_path), "project-a"))
+
+
+def test_upload_image_still_accepts_successful_media_response(monkeypatch, tmp_path):
+    _configure_store(monkeypatch, tmp_path)
+    image_path = tmp_path / "reference.png"
+    image_path.write_bytes(PNG_BYTES)
+
+    class Bridge:
+        async def api_request(self, endpoint, body, **kwargs):
+            return {"status": 200, "data": {"media": {"name": "uploaded-media-id"}}}
+
+    media_id = asyncio.run(upload_image(Bridge(), str(image_path), "project-a"))
+
+    assert media_id == "uploaded-media-id"
 
 
 def test_upload_is_reused_as_image_to_video_reference_without_duplicates(monkeypatch, tmp_path):

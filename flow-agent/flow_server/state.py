@@ -8,6 +8,7 @@ lifespan, the auth dependency, and the publish/history helpers.
 
 import os
 import sys
+import json
 import uuid
 import time
 import logging
@@ -46,7 +47,7 @@ async def recover_orphan_response(data: dict, meta: dict):
     """
     try:
         if data.get("status") != 200:
-            log.info("Orphan response %s ignored (status=%s)", data.get("id"), data.get("status"))
+            log.info("Orphan response %s ignored (status=%s, data=%s)", data.get("id"), data.get("status"), data.get("data"))
             return
         # Only images arrive inline; videos are polled separately, so only
         # image generations are recoverable this way.
@@ -96,6 +97,48 @@ def set_bridge(b):
     bridge = b
 
 
+def _backend_state_file() -> str:
+    """Must mirror _backend_state_file() in the CLI entrypoint (main.py)."""
+    state_home = os.environ.get("XDG_STATE_HOME") or os.path.join(
+        os.path.expanduser("~"), ".local", "state"
+    )
+    return os.path.join(state_home, "flow-agent", "backend.json")
+
+
+def _write_backend_state_file():
+    """Record the address this backend actually bound, so the CLI can find it
+    from shells that never inherited the port env vars."""
+    try:
+        path = _backend_state_file()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        payload = {
+            "host": os.environ.get("OPENAI_API_HOST", "127.0.0.1"),
+            "port": int(os.environ.get("OPENAI_API_PORT", "8001")),
+            "pid": os.getpid(),
+            "updated_at": int(time.time()),
+        }
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        os.replace(tmp, path)
+    except Exception:
+        log.warning("Could not write backend state file", exc_info=True)
+
+
+def _remove_backend_state_file():
+    try:
+        path = _backend_state_file()
+        with open(path, "r", encoding="utf-8") as f:
+            recorded = json.load(f)
+        # Only remove our own record — a different backend may have started.
+        if recorded.get("pid") == os.getpid():
+            os.remove(path)
+    except OSError:
+        pass
+    except Exception:
+        log.warning("Could not remove backend state file", exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global bridge
@@ -103,6 +146,7 @@ async def lifespan(app: FastAPI):
     bridge = ExtensionBridge()
     bridge.set_orphan_handler(recover_orphan_response)
     await bridge.start()
+    _write_backend_state_file()
 
     # Run extension connection in background
     asyncio.create_task(bridge.wait_for_extension(timeout=30))
@@ -110,6 +154,7 @@ async def lifespan(app: FastAPI):
     yield
 
     log.info("Closing Flow Agent Extension Bridge...")
+    _remove_backend_state_file()
     if bridge:
         await bridge.close()
 

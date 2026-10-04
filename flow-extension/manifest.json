@@ -9,6 +9,7 @@
     "128": "icon128.png"
   },
   "permissions": [
+    "cookies",
     "storage",
     "alarms",
     "tabs",
@@ -18,13 +19,17 @@
     "sidePanel"
   ],
   "host_permissions": [
+    "https://*.google.com/*",
     "https://labs.google/*",
+    "https://flow.google.com/*",
     "https://aisandbox-pa.googleapis.com/*",
     "https://aisandbox-pa.sandbox.googleapis.com/*",
     "https://storage.googleapis.com/*",
     "https://flow-content.google/*",
     "http://127.0.0.1:8001/*",
     "http://localhost:8001/*",
+    "http://127.0.0.1:18011/*",
+    "http://localhost:18011/*",
     "https://flow.kodelyx.in/*"
   ],
   "background": {
@@ -33,6 +38,7 @@
   "content_scripts": [
     {
       "matches": [
+        "https://flow.google.com/*",
         "https://labs.google/fx/tools/flow*",
         "https://labs.google/fx/*/tools/flow*"
       ],
@@ -48,6 +54,7 @@
         "injected.js"
       ],
       "matches": [
+        "https://flow.google.com/*",
         "https://labs.google/*"
       ]
     }

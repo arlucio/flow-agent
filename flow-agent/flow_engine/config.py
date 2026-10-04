@@ -32,6 +32,9 @@ def _load_env_file(path):
 
 _load_env_file(os.path.join(ROOT_DIR, ".env"))
 _load_env_file(os.path.join(ROOT_DIR, "config.env"))
+# User-level file lives outside the install tree so it survives reinstalls;
+# loaded last so deployment-local .env/config.env keep precedence.
+_load_env_file(os.path.join(os.path.expanduser("~"), ".config", "flow-agent", "env"))
 
 
 def _flow_binary_dir() -> str:
@@ -101,7 +104,7 @@ API_BASE = "https://aisandbox-pa.googleapis.com"
 CLIENT_CTX = {
     "tool": "PINHOLE",
     "tier": "PAYGATE_TIER_ONE",
-    "origin": "https://labs.google",
+    "origin": "https://flow.google.com",
     "recaptcha_app_type": "RECAPTCHA_APPLICATION_TYPE_WEB",
 }
 

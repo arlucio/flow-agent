@@ -33,10 +33,16 @@ def generate_single_item(
     model: str = "narwhal",
     max_retries: int = 2,
     retry_delay: float = 5.0,
-    base_url: str = "http://127.0.0.1:8001",
+    base_url: str = None,
     api_key: str = "flow-local",
 ):
     """Generate and save a single image or video with caching, async polling, and retry."""
+    if not base_url:
+        base_url = os.environ.get(
+            "FLOW_API_URL",
+            f"http://127.0.0.1:{os.environ.get('OPENAI_API_PORT', '8001')}",
+        )
+    base_url = base_url.rstrip("/")
     name = os.path.splitext(os.path.basename(out_file))[0]
     expected_ext = ".mp4" if item_type == "video" else ".png"
     
